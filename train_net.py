@@ -66,7 +66,7 @@ class Trainer(DefaultTrainer):
         """
         assert self.model.training, "[Trainer] model was changed to eval mode!"
         start = time.perf_counter()
-        data = next(self._data_loader_iter)
+        data = next(self._trainer._data_loader_iter)
         data_time = time.perf_counter() - start
         loss_dict = self.model(data)
         # RPN box loss:
@@ -74,11 +74,8 @@ class Trainer(DefaultTrainer):
         # R-CNN box loss:
         loss_dict["loss_box_reg"] *= self.rcnn_box_lw
         losses = sum(loss_dict.values())
-        self._detect_anomaly(losses, loss_dict)
 
-        metrics_dict = loss_dict
-        metrics_dict["data_time"] = data_time
-        self._write_metrics(metrics_dict)
+        self._trainer._write_metrics(loss_dict, data_time)
         self.optimizer.zero_grad()
         losses.backward()
         self.optimizer.step()

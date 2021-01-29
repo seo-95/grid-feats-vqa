@@ -15,6 +15,7 @@ from detectron2.modeling.roi_heads import (
 )
 from detectron2.modeling.roi_heads.fast_rcnn import FastRCNNOutputLayers
 from detectron2.modeling.poolers import ROIPooler
+from detectron2.structures import Boxes
 
 
 class AttributePredictor(nn.Module):
@@ -76,6 +77,11 @@ class AttributeROIHeads(ROIHeads):
     """
     An extension of ROIHeads to include attribute prediction.
     """
+
+    def __init__(self, cfg, attr_input_dim):
+        super(AttributeROIHeads, self).__init__(cfg)
+        self.attribute_predictor = AttributePredictor(cfg, attr_input_dim)
+
     def forward_attribute_loss(self, proposals, box_features):
         proposals, fg_selection_attributes = select_foreground_proposals(
             proposals, self.num_classes
@@ -88,12 +94,12 @@ class AttributeROIHeads(ROIHeads):
 
 
 @ROI_HEADS_REGISTRY.register()
-class AttributeRes5ROIHeads(AttributeROIHeads, Res5ROIHeads):
+class AttributeRes5ROIHeads(Res5ROIHeads):
     """
     An extension of Res5ROIHeads to include attribute prediction.
     """
     def __init__(self, cfg, input_shape):
-        super(Res5ROIHeads, self).__init__(cfg, input_shape)
+        super(AttributeRes5ROIHeads, self).__init__(cfg, input_shape)
 
         assert len(self.in_features) == 1
 
@@ -126,7 +132,7 @@ class AttributeRes5ROIHeads(AttributeROIHeads, Res5ROIHeads):
             )
 
         if self.attribute_on:
-            self.attribute_predictor = AttributePredictor(cfg, out_channels)
+            self.attribute_head = AttributeROIHeads(cfg, out_channels)
 
     def forward(self, images, features, proposals, targets=None):
         del images
@@ -154,7 +160,7 @@ class AttributeRes5ROIHeads(AttributeROIHeads, Res5ROIHeads):
                 del box_features
                 losses.update(self.mask_head(mask_features, proposals))
             if self.attribute_on:
-                losses.update(self.forward_attribute_loss(proposals, feature_pooled))
+                losses.update(self.attribute_head.forward_attribute_loss(proposals, feature_pooled))
             return [], losses
         else:
             pred_instances, _ = self.box_predictor.inference(predictions, proposals)
@@ -167,43 +173,56 @@ class AttributeRes5ROIHeads(AttributeROIHeads, Res5ROIHeads):
 
 
 @ROI_HEADS_REGISTRY.register()
-class AttributeStandardROIHeads(AttributeROIHeads, StandardROIHeads):
+class AttributeStandardROIHeads(StandardROIHeads):
     """
     An extension of StandardROIHeads to include attribute prediction.
     """
     def __init__(self, cfg, input_shape):
-        super(StandardROIHeads, self).__init__(cfg, input_shape)
+        super(AttributeStandardROIHeads, self).__init__(cfg, input_shape)
         self._init_box_head(cfg, input_shape)
         self._init_mask_head(cfg, input_shape)
         self._init_keypoint_head(cfg, input_shape)
+        if self.attribute_on:
+            self.attribute_head = AttributeROIHeads(cfg, self.box_head.output_shape.channels)
 
+    @classmethod
     def _init_box_head(self, cfg, input_shape):
         # fmt: off
+        in_features              = cfg.MODEL.ROI_HEADS.IN_FEATURES
         pooler_resolution        = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
-        pooler_scales            = tuple(1.0 / input_shape[k].stride for k in self.in_features)
+        pooler_scales            = tuple(1.0 / input_shape[k].stride for k in in_features)
         sampling_ratio           = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
         pooler_type              = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
-        self.train_on_pred_boxes = cfg.MODEL.ROI_BOX_HEAD.TRAIN_ON_PRED_BOXES
         self.attribute_on        = cfg.MODEL.ATTRIBUTE_ON
         # fmt: on
 
-        in_channels = [input_shape[f].channels for f in self.in_features]
+        # If StandardROIHeads is applied on multiple feature maps (as in FPN),
+        # then we share the same predictors and therefore the channel counts must be the same
+        in_channels = [input_shape[f].channels for f in in_features]
+        # Check all channel counts are equal
         assert len(set(in_channels)) == 1, in_channels
         in_channels = in_channels[0]
 
-        self.box_pooler = ROIPooler(
+        box_pooler = ROIPooler(
             output_size=pooler_resolution,
             scales=pooler_scales,
             sampling_ratio=sampling_ratio,
             pooler_type=pooler_type,
         )
-        self.box_head = build_box_head(
+        # Here we split "box head" and "box predictor", which is mainly due to historical reasons.
+        # They are used together so the "box predictor" layers should be part of the "box head".
+        # New subclasses of ROIHeads do not need "box predictor"s.
+        box_head = build_box_head(
             cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
         )
-        self.box_predictor = FastRCNNOutputLayers(cfg, self.box_head.output_shape)
+        box_predictor = FastRCNNOutputLayers(cfg, box_head.output_shape)
 
-        if self.attribute_on:
-            self.attribute_predictor = AttributePredictor(cfg, self.box_head.output_shape.channels)
+        return {
+            "box_in_features": in_features,
+            "box_pooler": box_pooler,
+            "box_head": box_head,
+            "box_predictor": box_predictor,
+        }
 
     def _forward_box(self, features, proposals):
         features = [features[f] for f in self.in_features]
@@ -221,7 +240,7 @@ class AttributeStandardROIHeads(AttributeROIHeads, StandardROIHeads):
                         proposals_per_image.proposal_boxes = Boxes(pred_boxes_per_image)
             losses = self.box_predictor.losses(predictions, proposals)
             if self.attribute_on:
-                losses.update(self.forward_attribute_loss(proposals, box_features))
+                losses.update(self.attribute_head.forward_attribute_loss(proposals, box_features))
                 del box_features
 
             return losses
@@ -234,4 +253,3 @@ class AttributeStandardROIHeads(AttributeROIHeads, StandardROIHeads):
 
         features = [features[f] for f in self.in_features]
         return features[0]
-
